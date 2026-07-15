@@ -19,7 +19,7 @@ from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QCheckBox, QFileDialog, QProgressBar, QPlainTextEdit,
-    QGroupBox, QSplitter, QDoubleSpinBox,
+    QGroupBox, QSplitter, QDoubleSpinBox, QListWidget,
 )
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -39,7 +39,10 @@ class UnlooperWindow(QMainWindow):
         self.setWindowTitle("Unlooper")
         self.resize(1200, 800)
 
-        self.input_file = None
+        self.input_files = []
+        self._active_file = None
+        self._queue_index = -1
+        self._batch_cancelled = False
         self.output_base_dir = SCRIPT_DIR
         self.process = None
         self._out_buffer = ""
@@ -59,10 +62,14 @@ class UnlooperWindow(QMainWindow):
 
         # Top bar: file picker
         top = QHBoxLayout()
-        self.open_btn = QPushButton("Open G-code File…")
-        self.open_btn.clicked.connect(self._open_file)
+        self.open_btn = QPushButton("Open G-code Files…")
+        self.open_btn.clicked.connect(self._open_files)
         top.addWidget(self.open_btn)
-        self.file_label = QLabel("No file selected")
+        self.clear_files_btn = QPushButton("Clear")
+        self.clear_files_btn.setEnabled(False)
+        self.clear_files_btn.clicked.connect(self._clear_files)
+        top.addWidget(self.clear_files_btn)
+        self.file_label = QLabel("No files selected")
         top.addWidget(self.file_label, stretch=1)
         root.addLayout(top)
 
@@ -72,6 +79,13 @@ class UnlooperWindow(QMainWindow):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(4, 4, 4, 4)
+
+        queue_group = QGroupBox("Files Queue")
+        queue_layout = QVBoxLayout(queue_group)
+        self.queue_list = QListWidget()
+        self.queue_list.setMaximumHeight(120)
+        queue_layout.addWidget(self.queue_list)
+        left_layout.addWidget(queue_group)
 
         opts_group = QGroupBox("Options")
         opts_layout = QVBoxLayout(opts_group)
@@ -197,23 +211,44 @@ class UnlooperWindow(QMainWindow):
 
     # ── File selection ───────────────────────────────────────────────────
 
-    def _open_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open G-code File", "",
+    def _open_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Open G-code File(s)", "",
             "G-code / Text Files (*.gcode *.txt *.nc *.tap);;All Files (*)",
         )
-        if not path:
+        if not paths:
             return
-        self.input_file = path
-        self.file_label.setText(path)
+        self.input_files = paths
+        self.queue_list.clear()
+        self.queue_list.addItems(Path(p).name for p in self.input_files)
+        self.file_label.setText(
+            paths[0] if len(paths) == 1 else f"{len(paths)} files selected"
+        )
+        self._active_file = None
+        self._queue_index = -1
         self._reset_results()
         self._update_run_enabled()
 
+    def _clear_files(self):
+        self.input_files = []
+        self._active_file = None
+        self._queue_index = -1
+        self.queue_list.clear()
+        self.file_label.setText("No files selected")
+        self._reset_results()
+        self._update_run_enabled()
+
+    def _set_queue_status(self, index: int, status: str):
+        item = self.queue_list.item(index)
+        if item is not None:
+            item.setText(f"{Path(self.input_files[index]).name}  —  {status}")
+
     def _update_run_enabled(self):
         running = self.process is not None and self.process.state() != QProcess.ProcessState.NotRunning
-        self.run_btn.setEnabled(bool(self.input_file) and not running)
+        self.run_btn.setEnabled(bool(self.input_files) and not running)
         self.cancel_btn.setEnabled(running)
         self.open_btn.setEnabled(not running)
+        self.clear_files_btn.setEnabled(bool(self.input_files) and not running)
 
     def _reset_results(self):
         self._run_completed = False
@@ -226,7 +261,7 @@ class UnlooperWindow(QMainWindow):
     # ── Run / cancel ─────────────────────────────────────────────────────
 
     def _stem(self) -> str:
-        return Path(self.input_file).stem
+        return Path(self._active_file).stem
 
     def _output_dir(self) -> Path:
         return self.output_base_dir / "Output" / self._stem()
@@ -244,15 +279,33 @@ class UnlooperWindow(QMainWindow):
 
     @Slot()
     def _start_run(self):
-        if not self.input_file or not UNLOOPER_SCRIPT.exists():
+        if not self.input_files or not UNLOOPER_SCRIPT.exists():
             self.status_label.setText(f"Error: cannot find {UNLOOPER_SCRIPT}")
             return
 
-        self._reset_results()
         self.log.clear()
+        self._batch_cancelled = False
+        self._queue_index = -1
+        self._run_next_file()
+
+    def _run_next_file(self):
+        self._queue_index += 1
+        if self._queue_index >= len(self.input_files):
+            self.status_label.setText(f"All {len(self.input_files)} file(s) complete")
+            self._update_run_enabled()
+            return
+
+        self._active_file = self.input_files[self._queue_index]
+        n = len(self.input_files)
+        position = self._queue_index + 1
+        name = Path(self._active_file).name
+
+        self._reset_results()
         self._out_buffer = ""
         self.progress_bar.setValue(0)
-        self.status_label.setText("Starting…")
+        self.status_label.setText(f"[{position}/{n}] Starting {name}…")
+        self.log.appendPlainText(f"\n===== [{position}/{n}] {name} =====")
+        self._set_queue_status(self._queue_index, "Running")
 
         unloop_only = "1" if self.unloop_only_check.isChecked() else "0"
         feedrate = str(self.feedrate_spin.value())
@@ -267,7 +320,7 @@ class UnlooperWindow(QMainWindow):
         self.process.setWorkingDirectory(str(self.output_base_dir))
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.process.setProgram(sys.executable)
-        self.process.setArguments([str(UNLOOPER_SCRIPT), self.input_file, unloop_only, feedrate, flowrate])
+        self.process.setArguments([str(UNLOOPER_SCRIPT), self._active_file, unloop_only, feedrate, flowrate])
         self.process.readyReadStandardOutput.connect(self._on_output)
         self.process.finished.connect(self._on_finished)
         self.process.errorOccurred.connect(self._on_process_error)
@@ -277,6 +330,7 @@ class UnlooperWindow(QMainWindow):
     @Slot()
     def _cancel_run(self):
         if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
+            self._batch_cancelled = True
             self.status_label.setText("Cancelling…")
             self.process.kill()
 
@@ -295,7 +349,7 @@ class UnlooperWindow(QMainWindow):
             m = TQDM_RE.match(line)
             if m:
                 self.progress_bar.setValue(int(m.group(1)))
-                self.status_label.setText(line)
+                self.status_label.setText(f"Rendering image… {m.group(1)}%")
                 continue
             self.log.appendPlainText(line)
             self.status_label.setText(line)
@@ -319,16 +373,24 @@ class UnlooperWindow(QMainWindow):
     def _on_finished(self, exit_code, exit_status):
         self._run_completed = True
         if exit_status == QProcess.ExitStatus.CrashExit:
-            self.status_label.setText("Cancelled / crashed")
+            status = "Cancelled" if self._batch_cancelled else "Crashed"
+            self.status_label.setText(status)
             self.progress_bar.setValue(0)
+            self._set_queue_status(self._queue_index, status)
         elif exit_code == 0:
             self.status_label.setText("Done")
             self.progress_bar.setValue(100)
             self._load_preview()
+            self._set_queue_status(self._queue_index, "Done")
         else:
             self.status_label.setText(f"Failed (exit code {exit_code}) — see log")
+            self._set_queue_status(self._queue_index, "Failed")
         self.output_folder_btn.setEnabled(self._output_dir().exists())
-        self._update_run_enabled()
+
+        if self._batch_cancelled:
+            self._update_run_enabled()
+            return
+        self._run_next_file()
 
     @Slot(QProcess.ProcessError)
     def _on_process_error(self, error):

@@ -42,9 +42,22 @@ Random Folder
 Command line
 This program can also be run from the command line using 
 ```
-python Gcode_processing.py "filename" "Unlooped"
+python Unlooper.py "filename" <unloop_only> [feedrate_mm_min] [flowrate_mg_min] [render_mode]
 ```
-where "filename" is replaced with the filepath and "Unlooped" is reaplced with either 1 or 0 
+where "filename" is replaced with the filepath and `<unloop_only>` is replaced with either 1 or 0.
+
+* `feedrate_mm_min` / `flowrate_mg_min` – optional overrides for the time / material estimate (0 or omitted = use the file's own values).
+* `render_mode` – optional, one of:
+  * `precise` (default) – the exact full-resolution raster render (`..._cv2_Image_output.png`). Accounts for fibre width and pass overlap; render time scales with part area.
+  * `preview` – a fast, NCViewer-style **vector** render (`..._preview.svg`). No line thickness and no pass-overlap colouring, but also no resolution ceiling: arcs are exact SVG arcs (never flattened into a polyline) and lines stay hairline-thin at any zoom level, so you can zoom in as far as the toolpath data actually resolves - this is the one to reach for when you need to inspect micron-scale pores. Open it in any browser, or view it directly in the GUI (below).
+  * `both` – write the precise image and the preview. The preview is written first so it's available almost immediately.
+  * `none` – skip rendering; only produce the unlooped code and the timing / material numbers.
+
+When running from a python editor, set `variables["render_mode"]` near the top of the script instead.
+
+## GUI
+
+`python Unlooper_gui.py` provides a front-end with a file queue, the override fields, and check-boxes for **Precise image** and **Fast preview** (tick either, both, or neither). Both are shown in the same pan/zoom viewer - scroll to zoom, drag to pan, double-click (or the **Fit** button) to reset the view - so the preview's SVG genuinely does zoom as far in as NCViewer does, right in the app. When both are enabled the preview appears first and is replaced by the precise image once it finishes. An **Open Preview in Browser** button opens the same `.svg` in your default browser, useful for a bigger window or for sharing the file.
 
 ## Setup
 

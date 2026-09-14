@@ -2,7 +2,11 @@ import cv2
 import psutil
 import os
 import sys
-from msvcrt import getch
+try:
+    from msvcrt import getch
+except ImportError:  # non-Windows: getch is only used for an optional "press any key" pause
+    def getch():
+        return b""
 
 # https://stackoverflow.com/questions/42660670/collapse-all-methods-in-visual-studio-code
 # crtl + k, crtl + 1
@@ -47,13 +51,10 @@ if __name__ == "__main__":
     from concurrent.futures import as_completed
     from sys import getsizeof
     # import glob
-    from moviepy.editor import VideoFileClip, concatenate_videoclips
-    from natsort import natsorted
     # from PIL import Image, ImageOps
     from tqdm import tqdm
     import mmap
     import subprocess
-    import pandas as pd
 
     # ************************************   Variables    ******************************************
     variables = {
@@ -130,7 +131,19 @@ if __name__ == "__main__":
 
         # Lag compensation
         "compensation_image": [],
-        "compensation_complete": False # This will change after the lag has been compensated
+        "compensation_complete": False, # This will change after the lag has been compensated
+
+        # Image rendering.
+        #   "precise" - exact full-resolution raster (fibre width + pass overlap), slow
+        #   "preview" - fast NCViewer-style vector (SVG) render: no line thickness, no
+        #               overlap, but no resolution ceiling either - exact arcs, and it
+        #               zooms as far as the toolpath data resolves instead of blocking up
+        #               into pixels the way a raster preview would (see render_preview_svg())
+        #   "both"    - write both
+        #   "none"    - skip rendering, just do the timing / material calculations
+        # CLI arg 5 overrides this; the GUI always sets it explicitly.
+        "render_mode": "precise",
+        "Generate_preview_image": False, # Derived from render_mode below
     }
     
     # ************************************ User Variables ******************************************
@@ -153,6 +166,17 @@ if __name__ == "__main__":
             variables["Feedrate_override_mm_min"] = float(sys.argv[3])
         if len(sys.argv) >= 5:
             variables["Flow_rate_override_mg_min"] = float(sys.argv[4])
+        # Optional: render mode - "precise", "preview", "both" or "none"
+        if len(sys.argv) >= 6:
+            variables["render_mode"] = sys.argv[5]
+
+    # Resolve the render mode into the two flags the rest of the program uses
+    _render_mode = str(variables["render_mode"]).strip().lower()
+    if _render_mode not in ("precise", "preview", "both", "none"):
+        _render_mode = "precise"
+    variables["render_mode"] = _render_mode
+    variables["Generate_output_image"] = _render_mode in ("precise", "both")
+    variables["Generate_preview_image"] = _render_mode in ("preview", "both")
     # ************************************ Functions ******************************************
     # Do not touch
     # Functions for reading in gcode:
@@ -172,6 +196,7 @@ if __name__ == "__main__":
         "Edit_Output": "",
         "Image_name": "",
         "Image": [],
+        "Preview_segments": [], # Numeric toolpath geometry (kind, x1, y1, x2, y2, cx, cy, sweep) for the fast preview
         # Array's
         "File_contents": [],
         "File_contents_edited": [], # This can be updated with the latest functions edit
@@ -1025,8 +1050,7 @@ if __name__ == "__main__":
             params, variables = check_command(params, variables)
             if params["command_check"] == False:
                 params["commands_used"][(variables["Current_X"], variables["Current_Y"], params["Line"], params["Positioning"])] = 1
-        # Segment the line into seperate cells
-        params, variables = segment_line(params, variables)
+        # Line is already segmented by line_reader() before this function is called - no need to repeat it
         if params["Positioning"] == "G90" or params["Positioning"] == "G90 ":
             if math.isnan(params["X_increase"]):
                 params["X2"] = variables["Current_X"]
@@ -1089,8 +1113,7 @@ if __name__ == "__main__":
             params, variables = check_command(params, variables)
             if params["command_check"] == False:
                 params["commands_used"][(variables["Current_X"], variables["Current_Y"], params["Line"], params["Positioning"])] = 1
-        # Segment the line into seperate cells
-        params, variables = segment_line(params, variables)
+        # Line is already segmented by line_reader() before this function is called - no need to repeat it
         # Update the end co-ordinates for the end of the curve ensure that the correct co-ordinate system is used
         if params["Positioning"] == "G90" or params["Positioning"] == "G90 ":
             if math.isnan(params["X_increase"]):
@@ -1231,8 +1254,7 @@ if __name__ == "__main__":
             params, variables = check_command(params, variables)
             if params["command_check"] == False:
                 params["commands_used"][(variables["Current_X"], variables["Current_Y"], params["Line"], params["Positioning"])] = 1
-        # Segment the line into seperate cells
-        params, variables = segment_line(params, variables)
+        # Line is already segmented by line_reader() before this function is called - no need to repeat it
         # Update the end co-ordinates for the end of the curve ensure that the correct co-ordinate system is used
         if params["Positioning"] == "G90" or params["Positioning"] == "G90 ":
             if math.isnan(params["X_increase"]):
@@ -1478,6 +1500,12 @@ if __name__ == "__main__":
                     temp_One_coordinate_system = ("G1 X" + str(round(variables["Current_X"] / variables["scale"],decimal_place)) + " Y" + str(round(variables["Current_Y"] * -1 / variables["scale"],5)) + " F" + str(round(params["Feed_rate"] * 60,decimal_place)) 
                     + " ; " + str(round(params["Centre_1"][0] / variables["scale"],decimal_place)) + " " + str(round(params["Centre_1"][1] * -1 / variables["scale"],decimal_place)) + " " + str(int(params["Command_number"])))
                     params["One_coordinate_system"].append(temp_One_coordinate_system)
+                    if variables["Generate_preview_image"]:
+                        # Capture the straight move for the fast preview (numeric, µm, no strings)
+                        sx, sy = params["Centre_1"][0], params["Centre_1"][1]
+                        ex, ey = params["Centre_2"][0], params["Centre_2"][1]
+                        if sx != ex or sy != ey:
+                            params["Preview_segments"].append((int(params["Command_number"]), sx, sy, ex, ey, 0.0, 0.0, 0.0))
                     if variables["high_speed"] == False:
                         params["Pixel_coords_um"][temp_length_pixel_coords][2] = temp_One_coordinate_system
                         # Used in lag vector to set the length of the computation without having to calculate it
@@ -1498,6 +1526,11 @@ if __name__ == "__main__":
                     temp_One_coordinate_system = ("G2 X" + str(round(variables["Current_X"]  / variables["scale"],decimal_place)) + " Y" + str(round(variables["Current_Y"] * -1 / variables["scale"],decimal_place)) + " I" + str(round(params["I_increase"] / variables["scale"],decimal_place)) + " J" + str(round(params["J_increase"] / variables["scale"],decimal_place)) + " F" + str(round(params["Feed_rate"] * 60, decimal_place)) 
                     + " ; " + str(round(params["X1"] / variables["scale"],decimal_place)) + " " + str(round(params["Y1"] * -1 / variables["scale"],decimal_place)) + " " + str(round(params["Centre_1"][0] / variables["scale"],decimal_place)) + " " + str(round(params["Centre_1"][1] * -1 / variables["scale"],decimal_place)) + " " + str(round(params["Diff"],decimal_place)) + " " + str(int(params["Command_number"])))
                     params["One_coordinate_system"].append(temp_One_coordinate_system)
+                    if variables["Generate_preview_image"]:
+                        # Capture the arc for the fast preview: start, end, centre, sweep (deg)
+                        params["Preview_segments"].append((2, params["X1"], params["Y1"],
+                            variables["Current_X"], variables["Current_Y"],
+                            params["Centre_1"][0], params["Centre_1"][1], params["Diff"]))
                     if variables["high_speed"] == False:
                         params["Pixel_coords_um"][temp_length_pixel_coords][2] = temp_One_coordinate_system
                         # Used in lag vector to set the length of the computation without having to calculate it
@@ -1518,6 +1551,11 @@ if __name__ == "__main__":
                     temp_One_coordinate_system = ("G3 X" + str(round(variables["Current_X"]  / variables["scale"],decimal_place)) + " Y" + str(round(variables["Current_Y"] * -1 / variables["scale"],decimal_place)) + " I" + str(round(params["I_increase"] / variables["scale"],decimal_place)) + " J" + str(round(params["J_increase"] / variables["scale"],decimal_place)) + " F" + str(round(params["Feed_rate"] * 60, decimal_place)) 
                     + " ; " + str(round(params["X1"] / variables["scale"],decimal_place)) + " " + str(round(params["Y1"] * -1 / variables["scale"],decimal_place)) + " " + str(round(params["Centre_1"][0] / variables["scale"],decimal_place)) + " " + str(round(params["Centre_1"][1] * -1 / variables["scale"],decimal_place)) + " " + str(round(params["Diff"],decimal_place)) + " " + str(int(params["Command_number"]))) #params["Command_number"]
                     params["One_coordinate_system"].append(temp_One_coordinate_system)
+                    if variables["Generate_preview_image"]:
+                        # Capture the arc for the fast preview: start, end, centre, sweep (deg)
+                        params["Preview_segments"].append((3, params["X1"], params["Y1"],
+                            variables["Current_X"], variables["Current_Y"],
+                            params["Centre_1"][0], params["Centre_1"][1], params["Diff"]))
                     if variables["high_speed"] == False:
                         params["Pixel_coords_um"][temp_length_pixel_coords][2] = temp_One_coordinate_system
                         # Used in lag vector to set the length of the computation without having to calculate it
@@ -1617,6 +1655,163 @@ if __name__ == "__main__":
             cv2.imwrite(params["Image_name"], params["Image"])
         elif variables["Generate_output_image"] == True:
             cv2.imwrite(params["Image_name"], params["Image"])
+        print("Precise image saved:", params["Image_name"])
+
+    def render_preview_svg(params, variables):
+        # NCViewer-style toolpath preview, as a vector image. A raster preview is always
+        # a fixed pixel grid - zoom in far enough and it blocks up into squares no matter
+        # how high its resolution is set (this is what a PNG-based first cut of this
+        # feature did, and it's why it's gone). SVG has no such ceiling: arcs are emitted
+        # as exact SVG arc commands (never flattened into a polyline), and strokes use
+        # vector-effect="non-scaling-stroke" so the line stays hairline-thin at any zoom
+        # instead of growing with it. The GUI embeds this directly with live pan/zoom;
+        # it can also be opened in any browser for the same result.
+        segs = params["Preview_segments"]
+        _kind_names = {0: "G0", 1: "G1", 2: "G2", 3: "G3"}
+        _kind_counts = {k: 0 for k in _kind_names}
+        for _kind, *_ in segs:
+            _kind_counts[_kind] = _kind_counts.get(_kind, 0) + 1
+        print("Debug: render_preview_svg got", len(segs), "segments -",
+              ", ".join(f"{_kind_names[k]}={_kind_counts[k]}" for k in _kind_names))
+        if not segs:
+            print("Preview: no drawable moves found - skipping preview")
+            return
+
+        xs, ys = [], []
+        commands = {0: [], 1: [], 2: [], 3: []}
+        for kind, x1, y1, x2, y2, cx, cy, sweep in segs:
+            if kind <= 1:
+                xs += [x1, x2]
+                ys += [y1, y2]
+                commands[kind].append(f"M{x1:.3f} {y1:.3f} L{x2:.3f} {y2:.3f}")
+                continue
+            radius = math.hypot(x1 - cx, y1 - cy)
+            xs += [x1, x2]
+            ys += [y1, y2]
+            # Coincident endpoints mean a full circle. This must be judged purely on that,
+            # not on sweep: Plotting_G2_2D/G3_2D's own q==0 branch (this case) never sets
+            # Diff, so sweep here can be a stale leftover from whatever arc ran before it.
+            closed = radius <= 0 or math.hypot(x2 - x1, y2 - y1) < max(1e-6, radius * 1e-9)
+            if closed:
+                # The full circle's own bbox is exact here - nothing to trim.
+                xs += [cx - radius, cx + radius]
+                ys += [cy - radius, cy + radius]
+            elif radius > 0:
+                # Exact bbox of the swept portion only (not the whole circle - a large
+                # partial arc, e.g. 180 degrees, only bulges out on one side): the extreme
+                # point in each axis direction only counts if the sweep actually passes
+                # through it. Cheap - four angle checks, no tessellation needed.
+                theta1 = math.atan2(y1 - cy, x1 - cx)
+                sweep_rad = math.radians(sweep)
+                for a in (0.0, math.pi / 2, math.pi, -math.pi / 2):
+                    passed = (a - theta1) % (2 * math.pi) if kind == 2 else (theta1 - a) % (2 * math.pi)
+                    if passed <= sweep_rad + 1e-9:
+                        xs.append(cx + radius * math.cos(a))
+                        ys.append(cy + radius * math.sin(a))
+            if closed:
+                # SVG can't express a full circle as a single arc (degenerate start == end) -
+                # draw it as two half-circle arcs instead.
+                commands[kind].append(
+                    f"M{cx - radius:.3f} {cy:.3f} "
+                    f"A{radius:.3f} {radius:.3f} 0 1 1 {cx + radius:.3f} {cy:.3f} "
+                    f"A{radius:.3f} {radius:.3f} 0 1 1 {cx - radius:.3f} {cy:.3f}"
+                )
+            else:
+                large_arc = 1 if sweep > 180.0 else 0
+                # G2 (kind 2) sweeps the parametric angle upward, G3 (kind 3) downward -
+                # per the SVG spec (theta increasing <=> sweep-flag 1) that is exactly
+                # sweep-flag 1 vs 0. Matches docircle()'s own rotation convention, which
+                # rotates dir-2 (G2) positive and dir-3 (G3) negative.
+                sweep_flag = 1 if kind == 2 else 0
+                commands[kind].append(
+                    f"M{x1:.3f} {y1:.3f} A{radius:.3f} {radius:.3f} 0 {large_arc} {sweep_flag} "
+                    f"{x2:.3f} {y2:.3f}"
+                )
+
+        if not xs:
+            print("Preview: no drawable moves found - skipping preview")
+            return
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        margin = max(max_x - min_x, max_y - min_y, 1.0) * 0.02
+        vb_x, vb_y = min_x - margin, min_y - margin
+        vb_w, vb_h = (max_x - min_x) + 2 * margin, (max_y - min_y) + 2 * margin
+        print(f"Debug: preview bbox x=[{min_x:.1f}, {max_x:.1f}] y=[{min_y:.1f}, {max_y:.1f}] µm, "
+              f"path commands: " + ", ".join(f"{_kind_names[k]}={len(commands[k])}" for k in _kind_names))
+
+        def rgb(colour):
+            b, g, r = colour  # colours are stored BGR to match cv2's convention elsewhere
+            return f"rgb({r},{g},{b})"
+
+        colours = {
+            0: (180, 180, 180),
+            1: variables["G1_colour"],
+            2: variables["G2_colour"],
+            3: variables["G3_colour"],
+        }
+        parts = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{vb_x:.3f} {vb_y:.3f} {vb_w:.3f} {vb_h:.3f}">',
+            f'<rect x="{vb_x:.3f}" y="{vb_y:.3f}" width="{vb_w:.3f}" height="{vb_h:.3f}" '
+            f'fill="{rgb(variables["Background_colour"])}"/>',
+        ]
+        # Faint 1 mm reference grid, coarsened so a huge/finely-pitched part doesn't emit
+        # an absurd number of grid lines (the toolpath itself has no such limit - only this
+        # cosmetic grid does).
+        spacing, max_lines = 1000.0, 400
+        while vb_w / spacing > max_lines or vb_h / spacing > max_lines:
+            spacing *= 5
+        grid = []
+        gx = math.floor(vb_x / spacing) * spacing
+        while gx <= vb_x + vb_w:
+            grid.append(f"M{gx:.3f} {vb_y:.3f} V{vb_y + vb_h:.3f}")
+            gx += spacing
+        gy = math.floor(vb_y / spacing) * spacing
+        while gy <= vb_y + vb_h:
+            grid.append(f"M{vb_x:.3f} {gy:.3f} H{vb_x + vb_w:.3f}")
+            gy += spacing
+        if grid:
+            parts.append(
+                f'<path d="{" ".join(grid)}" fill="none" stroke="rgb(230,230,230)" '
+                f'stroke-width="1" vector-effect="non-scaling-stroke"/>'
+            )
+        # Qt's SVG parser silently drops a <path> element's whole d attribute once it
+        # gets too long (~590-600 KB in testing - "Invalid path data; path truncated.",
+        # and the element then renders nothing at all, not even a partial path). A
+        # dense/large scaffold can produce single-kind d strings tens of MB long, so
+        # each kind is split across as many <path> elements as it takes to keep every
+        # one comfortably under that ceiling. Splitting is purely a parser workaround -
+        # each move is already its own "M.. L.." / "M.. A..", so a chunk boundary never
+        # introduces a visible gap.
+        max_chunk_chars = 200_000
+        chunk_counts = {}
+        for kind in (0, 2, 3, 1):  # rapids and arcs first, G1 print path drawn on top
+            if not commands[kind]:
+                continue
+            chunks, buf, buf_len = [], [], 0
+            for cmd in commands[kind]:
+                if buf and buf_len + len(cmd) + 1 > max_chunk_chars:
+                    chunks.append(" ".join(buf))
+                    buf, buf_len = [], 0
+                buf.append(cmd)
+                buf_len += len(cmd) + 1
+            if buf:
+                chunks.append(" ".join(buf))
+            chunk_counts[kind] = len(chunks)
+            for d in chunks:
+                parts.append(
+                    f'<path d="{d}" fill="none" stroke="{rgb(colours[kind])}" '
+                    f'stroke-width="1" vector-effect="non-scaling-stroke"/>'
+                )
+        print("Debug: emitted path elements per kind:",
+              ", ".join(f"{_kind_names[k]}={chunk_counts[k]}" for k in chunk_counts) or "(none)")
+        parts.append("</svg>")
+
+        out_path = "Output/" + params["Filename_only"] + "/" + params["Filename_only"] + "_preview.svg"
+        svg_text = "\n".join(parts)
+        with open(out_path, "w") as f:
+            f.write(svg_text)
+        print(f"Debug: wrote {len(svg_text)} bytes to {out_path}")
+        print("Preview vector saved:", out_path)
 
     def motion_calculations(params, variables):
         # Variables for the new start location
@@ -1675,6 +1870,19 @@ if __name__ == "__main__":
         #     min_y = min(y_pixel_cords) / 100
         #     max_y = max(y_pixel_cords) / 100
         # else:
+        _preview_note = (f" ({len(params['Preview_segments'])} captured for the preview)"
+                         if variables["Generate_preview_image"] else "")
+        print(f"Debug: motion_calculations walked {len(params['Unlooped_contents'])} lines, "
+              f"{len(params['Current_X_array'])} of them were G0/G1/G2/G3 moves{_preview_note}.")
+        if not params["Current_X_array"]:
+            # This used to be a bare min()/max() call, which raises an opaque
+            # "ValueError: min() arg is an empty sequence" here - if nothing in the
+            # unlooped file was recognised as a move, say so plainly instead.
+            sys.exit(
+                f"Error: no G0/G1/G2/G3 moves were found in {len(params['Unlooped_contents'])} "
+                "unlooped lines. If that line count looks far too small for the input file, "
+                "the M98/M99 loop handling is the likely place to look first."
+            )
         min_x = min(params["Current_X_array"])
         max_x = max(params["Current_X_array"])
         variables["min_x"] = min_x
@@ -1683,6 +1891,7 @@ if __name__ == "__main__":
         max_y = max(params["Current_Y_array"])
         variables["min_y"] = min_y
         variables["max_y"] = max_y
+        print(f"Debug: extents x=[{min_x:.3f}, {max_x:.3f}] mm  y=[{min_y:.3f}, {max_y:.3f}] mm")
         # Can calculate the size of the scaffold and determine which corner I am calculating from
         # Need to determine which orientation the scaffold is from zero value and correct the current x and y
 
@@ -1780,6 +1989,15 @@ if __name__ == "__main__":
     params = check_outputs      (params)
     # Unloop the code to allow for it to be read line by line and for the unlooped code to be saved to a txt file
     params = line_by_line       (params)
+    # Debug: how much actually came out of unlooping, and how much of it looks drawable.
+    # A large input file that unloops into a suspiciously small (or empty) result here
+    # points at the M98/M99 loop handling, not at anything downstream (plotting/preview).
+    _drawable = sum(
+        1 for _l in params["Unlooped_contents"]
+        if re.match(r"\s*G0*[0123]\b", _l)
+    )
+    print(f"Debug: unlooped {len(params['Unlooped_contents'])} lines "
+          f"({_drawable} look like G0/G1/G2/G3 moves).")
     file_contents = []
     # Close the unlooped text file as it is no longer required
     params["Text_File"].close()
@@ -1806,6 +2024,11 @@ if __name__ == "__main__":
         # # Second variable make equal to 2 if you want to save animation as well as save the image
         # # Second variable make equal to 3 if you want to save image only
         
+        # Fast preview first so it is available almost immediately, then the slow precise render
+        if variables["Generate_preview_image"] == True:
+            preview_start = time.time()
+            render_preview_svg(params, variables)
+            print("It took", round(time.time() - preview_start, 2), "seconds to render the fast preview.")
         if variables["Generate_output_image"] == True:
             Plot_code(params, variables)
         save_outputs(params,variables)

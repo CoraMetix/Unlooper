@@ -1,13 +1,10 @@
 opencv-python
 numpy
 matplotlib
-datetime
 scipy
 ipywidgets
 subpixel_edges
-argparse
 Pillow
-pandas
 PySide6
 glob2
 seaborn
@@ -15,7 +12,4 @@ statannot
 wheel
 sympy
 psutil
-multiprocessing
-moviepy
-natsort
 tqdm

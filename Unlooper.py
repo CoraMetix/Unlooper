@@ -313,6 +313,11 @@ if __name__ == "__main__":
         file.close()
         return params
 
+    def is_macro_line(line):
+        # Lines starting with a square bracket are user macros (e.g. "[pressure 20]", "[Scaffold1] (X3.5 Y10.0)")
+        # These are passed through to the unlooped output untouched and ignored by the motion calculations
+        return line.lstrip().startswith("[")
+
     def does_line_contain_P_l(line):
         # This function is called as part of the unlooping for sub-programs
         # Function to return the number of times a line contains P or l
@@ -401,7 +406,11 @@ if __name__ == "__main__":
         temp = copy.deepcopy(params["File_contents_edited"])
         params["File_contents_edited"] = []
         for line in temp:
-            params["File_contents_edited"].append(line.upper())
+            if is_macro_line(line):
+                # Keep macros exactly as written
+                params["File_contents_edited"].append(line)
+            else:
+                params["File_contents_edited"].append(line.upper())
         return params
 
     def parameters_extraction(params, variables):
@@ -556,7 +565,10 @@ if __name__ == "__main__":
             #     return_contents.append(newline[0])
             # For multiple G commands on the same line scan through the line and then break at each of the G commands
             # Whilst doing this I will also remove any +signs after the G commands
-            if line.find("G") != -1:
+            if is_macro_line(line):
+                # Macros may contain G's in their names so never split them
+                params["File_contents_edited"].append(line)
+            elif line.find("G") != -1:
                 # If line contains a G command Split the line at every command
                 newline = line.split("G", -1)
                 # See if there are multiple splits
@@ -703,7 +715,7 @@ if __name__ == "__main__":
         O_second = [i[1] for i in params["O_Array"]]
         while True:
             # If current line does contain M2 stop
-            if current_line.find("M2") != -1:
+            if not is_macro_line(current_line) and current_line.find("M2") != -1:
                 # End of program
                 break
 
@@ -736,7 +748,7 @@ if __name__ == "__main__":
             #                 # subprogram = params["O_Array"][m-1][1]
             #                 break
 
-            if current_line.find("M99") != -1:
+            if not is_macro_line(current_line) and current_line.find("M99") != -1:
                 # Need to go to start of loop again and decrement params["M98_Array"]_variable
                 # Only need to find the closest o command above it
                 for n in range(len(params["M99_Array"])):
@@ -769,7 +781,11 @@ if __name__ == "__main__":
             # Break out the following into another function
             # Add the ability to ignore blank lines like the one at the end of the code
             # This goes through the code and appends it to the unlooped file and ignores the loop commands
-            if (current_line.find("M99", 0, 3) == -1 and current_line.find("M98", 0, 3) == -1 and current_line.find("O", 0, 1) == -1):
+            if is_macro_line(current_line):
+                # Pass macros straight through without prefixing the last command
+                params["Unlooped_contents"].append(current_line)
+                params["Text_File"].write(current_line + "\n")
+            elif (current_line.find("M99", 0, 3) == -1 and current_line.find("M98", 0, 3) == -1 and current_line.find("O", 0, 1) == -1):
                 # If current command is not one of the listed commands i.e. does not contain M or G or D
                 if (current_line.find("G", 0, 1) != -1 or current_line.find("M", 0, 1) != -1 or current_line.find("D", 0, 1) != -1 or current_line.find("F", 0, 1) != -1 or current_line.find("O", 0, 1) != -1):
                     # Add new line to output file or terminal
@@ -1405,7 +1421,9 @@ if __name__ == "__main__":
         return params
 
     def segment_line(params, variables):
-        params["Command_array"] = (re.findall(r"[^\W\d_]+|[-+]?(?:\d*\.*\d+)", params["Line"]))
+        # Strip any square bracket macros first so their contents are not read as motion commands
+        line = re.sub(r"\[[^\]]*\]", "", params["Line"])
+        params["Command_array"] = (re.findall(r"[^\W\d_]+|[-+]?(?:\d*\.*\d+)", line))
         # Check the array length and make sure that it is even otherwise throw an error
         if (len(params["Command_array"]) % 2 == 1):
             # Length is off throw an error and pass it the line
